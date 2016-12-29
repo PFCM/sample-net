@@ -66,3 +66,9 @@ This model admits a number of obvious extensions:
     just feed in a phoneme per frame, although with a big enough frame
     size at the top level and the learned upsampling we might get away
     with it.
+- translate between sequences
+  - the RNN inputs might not be the inputs to the autoregressive MLP.
+  - not going to be able to do things like wave-to-wave language
+    translation because you'll run into all sorts of alignment issues.
+  - might be able to do things like transfer accents/voices which
+    could be a laugh.
