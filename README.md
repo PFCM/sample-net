@@ -38,6 +38,8 @@ over possible values. While this is nice, it pretty much limits us to
 8 bit (as does the embedding lookup) seeing as the next step up in
 terms of quality is 16 bit, and personally I'd rather avoid a softmax
 over 2^16 values (or storing a 2^16 x anything embedding matrix).
+In my personal experience, usually humans start hearing artifacts
+around 10 or 11 bits.
 
 In summary, this model is still very large. What is interesting about
 it is the hierarchical RNNs and the autoregressive MLP to smooth
