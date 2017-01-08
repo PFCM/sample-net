@@ -165,3 +165,12 @@ class TestArchitecture(test.TestCase):
         for var in outputs:
             # check the appropriate number is in the name of the variable
             self.assertIn('projection_{}'.format(next(scope_nums)), var.name)
+
+    def test_samplenet_shapes(self):
+        """make sure we can construct the graph and get back what we expect"""
+        inputs = tf.random_uniform([50, 512*8], dtype=tf.int32, minval=0,
+                                   maxval=255)
+        inputs = tf.saturate_cast(inputs, tf.uint8)
+        outputs = arch.sample_net_train(inputs)
+
+        self.assertEqual(outputs.get_shape().as_list(), [50, 512*8-128+1, 256])

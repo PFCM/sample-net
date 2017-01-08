@@ -253,8 +253,9 @@ def linear_projection(inputs, output_size=None, rate=1, weightnorm=True,
         return projections[0]
 
 
-def sample_net_train(inputs, frame_size_zero=128, cell=None, recurrent_tiers=3,
-                     upsample_ratio=4, mlp_shape=None):
+def sample_net_train(inputs, frame_size_zero=128, cell=None,
+                     embedding_size=256, recurrent_tiers=3, upsample_ratio=4,
+                     mlp_shape=None):
     """Puts together the SampleNet model for training. This is different from
     putting it together for generating audio, because it's much easier to
     wrangle the RNNs when we know that all the data will be provided in
@@ -296,6 +297,9 @@ def sample_net_train(inputs, frame_size_zero=128, cell=None, recurrent_tiers=3,
             the output of the network, to be turned into a distribution over
             sample values.
     """
+    # defaults
+    if cell is None:
+        cell = tf.nn.rnn_cell.GRUCell(1024)
     # the first thing to do is sort out the data
     batch_size = inputs.get_shape()[0].value
     if inputs.dtype == tf.uint8:
@@ -320,6 +324,7 @@ def sample_net_train(inputs, frame_size_zero=128, cell=None, recurrent_tiers=3,
             print('tier: {}, frame size: {}'.format(tier, current_frame_size))
             rnn_inputs = non_overlapping_frames(float_inputs,
                                                 current_frame_size)
+            print('         {} frames'.format(len(rnn_inputs)))
             if tier != recurrent_tiers:
                 # then we have an output to condition on
                 # so we first need to upsample it
@@ -328,48 +333,88 @@ def sample_net_train(inputs, frame_size_zero=128, cell=None, recurrent_tiers=3,
                 rnn_inputs = linear_projection(rnn_inputs,
                                                output_size=input_size,
                                                rate=1,
-                                               weightnorm=True)
+                                               weightnorm=True,
+                                               scope='sample_projection')
                 # then upsample the previous outputs
                 upsampled = linear_projection(rnn_outputs,
                                               output_size=input_size,
                                               rate=upsample_ratio,
-                                              weightnorm=True)
+                                              weightnorm=True,
+                                              scope='upsample_projection')
                 # just a quick sanity check
                 assert len(rnn_inputs) == len(upsampled)
                 # and stick them together
                 rnn_inputs = [prev + samples for prev, samples
                               in zip(upsampled, rnn_inputs)]
-            initial_states.append(cell.zero_state(batch_size))
-            rnn_outputs, final_state = tf.nn.rnn(
-                cell, rnn_inputs, initial_states[-1], dtype=tf.float32)
+            # might be nice to avoid doing this too much
+            rnn_inputs = tf.stack(rnn_inputs)
+            initial_states.append(cell.zero_state(batch_size, tf.float32))
+            rnn_outputs, final_state = tf.nn.dynamic_rnn(
+                cell, rnn_inputs, initial_state=initial_states[-1],
+                dtype=tf.float32, time_major=True)
+            rnn_outputs = tf.unstack(rnn_outputs)
             final_states.append(final_state)
         # reduce the receptive field for the next tier
-        current_frame_size /= upsample_ratio
+        current_frame_size //= upsample_ratio
     # upsample the output of the final rnn to give us per-sample conditioning
     # vectors
     rnn_outputs = linear_projection(rnn_outputs, output_size=embedding_size,
-                                    rate=upsample_ratio, weightnorm=True)
-    print('{} rnn outs, {} samples'.format(len(rnn_outputs), len(inputs)))
+                                    rate=current_frame_size*upsample_ratio,
+                                    weightnorm=True)
+    print('{} rnn outs, {} samples'.format(len(rnn_outputs),
+                                           inputs.get_shape()[1].value))
 
     # and now we can get the autoregressive mlp
     # this is going to make the graph a bit crazy because we are going to have
     # to do this for each sample
 
     # first step is to get the inputs sorted, we want them batch major,
-    # flattened to 2D
-    if embedded_inputs is not None:
-        mlp_inputs = tf.transpose(embedded_inputs, [1, 0, 2])
-        mlp_inputs = tf.reshape(mlp_inputs, [batch_size, -1])
+    # and [batch, time, 1, features]
+    if embedded_inputs is None:
+        mlp_inputs = tf.expand_dims(float_inputs, -1)
     else:
-        mlp_inputs = float_inputs
+        mlp_inputs = embedded_inputs
+    mlp_inputs = tf.expand_dims(mlp_inputs, 2)
 
-    mlp_outputs = []
-    with tf.variable_scope('mlp') as scope:
-        for i in range(len(inputs)):
-            # get a window of samples
-            window = mlp_inputs[:, i:i+frame_size_zero]
-            # project it
-            window, = linear_projection([windows])
+    # mlp_outputs = []
+    # with tf.variable_scope('mlp') as scope:
+    #     for i in range(len(inputs)):
+    #         # get a window of samples
+    #         window = mlp_inputs[:, i:i+frame_size_zero]
+    #         # project it
+    #         window, = linear_projection([window])
+    #         # add to the appropriate conditioning vector
+    #         inp = window + rnn_outputs[i]
+    #         # and get the mlp
+    #         mlp_outputs.append(autoregressive_mlp(inp, shape=mlp_shape))
+    #         # if this was the first time, start reusing variables for later
+    #         if i == 0:
+    #             scope.reuse_variables()
+    # return tf.stack(mlp_outputs, name='samplenet_output', axis=1)
+
+    # apply the mlp convolutionally
+    # probably the best way to do this is with a loop as per dynamic_rnn
+    with tf.variable_scope('output_tier'):
+        # first actually pull out the overlapping windows
+        # this is potentially going to use absurd quantities of memory
+        mlp_inputs = tf.extract_image_patches(
+            mlp_inputs, [1, frame_size_zero, 1, 1], [1, 1, 1, 1],
+            [1, 1, 1, 1],
+            padding='VALID')
+        # reshape into an enormous batch
+        mlp_inputs = tf.reshape(mlp_inputs,
+                                [-1, mlp_inputs.get_shape()[-1].value])
+        print('mlp inputs: {}'.format(mlp_inputs.get_shape()))
+        # and run the mlp
+        mlp_outputs = autoregressive_mlp(mlp_inputs, shape=mlp_shape)
+        # now reshape the outputs to what we want: `[batch, time, ...]`
+        print('mlp_outputs: {}'.format(mlp_outputs.get_shape()))
+        mlp_outputs = tf.reshape(mlp_outputs,
+                                 [batch_size,
+                                  inputs.get_shape()[1].value-frame_size_zero+1,
+                                  -1])
+
+    return mlp_outputs
 
 
 if __name__ == '__main__':
