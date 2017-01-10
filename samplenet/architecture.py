@@ -145,7 +145,8 @@ def autoregressive_mlp(input_frame, shape=None, scope='ar_mlp'):
 
     Args:
         input_frame (tensor): the (possibly embedded and flattened) 2D
-            input tensor of floats.
+            input tensor of floats. If not 2D, then we flatten it and reshape
+            the output appropriately
         shape (Optional[list]): list of the numbers of hidden states
             per layer (including the output layer, so it depends how
             you want to construct the distribution). If not specified,
@@ -158,6 +159,12 @@ def autoregressive_mlp(input_frame, shape=None, scope='ar_mlp'):
     """
     if not shape:
         shape = [1024, 1024, 256]
+    if len(input_frame.get_shape()) != 2:
+        original_shape = input_frame.get_shape().as_list()
+        # flatten out the batch of windows
+        input_frame = tf.reshape(input_frame, [original_shape[0], -1])
+    else:
+        original_shape = None
     # no batch norm, relus until the last layer
     with slim.arg_scope([slim.fully_connected],
                         activation_fn=tf.nn.relu,
@@ -166,6 +173,11 @@ def autoregressive_mlp(input_frame, shape=None, scope='ar_mlp'):
         with tf.variable_scope(scope):
             net = slim.stack(input_frame, slim.fully_connected, shape[:-1])
             net = slim.fully_connected(net, shape[-1], activation_fn=None)
+    # if original_shape:
+    #     original_shape[-1] = shape[-1]
+    #     net = tf.reshape(net, original_shape, name='mlp_out')
+    # else:
+            net = tf.identity(net, name='mlp_out')
     return net
 
 
@@ -369,12 +381,12 @@ def sample_net_train(inputs, frame_size_zero=128, cell=None,
     # to do this for each sample
 
     # first step is to get the inputs sorted, we want them batch major,
-    # and [batch, time, 1, features]
+    # and [batch, time, features]
     if embedded_inputs is None:
         mlp_inputs = tf.expand_dims(float_inputs, -1)
     else:
         mlp_inputs = embedded_inputs
-    mlp_inputs = tf.expand_dims(mlp_inputs, 2)
+    # mlp_inputs = tf.expand_dims(mlp_inputs, 2)
 
     # mlp_outputs = []
     # with tf.variable_scope('mlp') as scope:
@@ -394,27 +406,70 @@ def sample_net_train(inputs, frame_size_zero=128, cell=None,
 
     # apply the mlp convolutionally
     # probably the best way to do this is with a loop as per dynamic_rnn
-    with tf.variable_scope('output_tier'):
-        # first actually pull out the overlapping windows
-        # this is potentially going to use absurd quantities of memory
-        mlp_inputs = tf.extract_image_patches(
-            mlp_inputs, [1, frame_size_zero, 1, 1], [1, 1, 1, 1],
-            [1, 1, 1, 1],
-            padding='VALID')
-        # reshape into an enormous batch
-        mlp_inputs = tf.reshape(mlp_inputs,
-                                [-1, mlp_inputs.get_shape()[-1].value])
-        print('mlp inputs: {}'.format(mlp_inputs.get_shape()))
-        # and run the mlp
-        mlp_outputs = autoregressive_mlp(mlp_inputs, shape=mlp_shape)
-        # now reshape the outputs to what we want: `[batch, time, ...]`
-        print('mlp_outputs: {}'.format(mlp_outputs.get_shape()))
-        mlp_outputs = tf.reshape(mlp_outputs,
-                                 [batch_size,
-                                  inputs.get_shape()[1].value-frame_size_zero+1,
-                                  -1])
+    # with tf.variable_scope('output_tier'):
+    #     # first actually pull out the overlapping windows
+    #     # this is potentially going to use absurd quantities of memory
+    #     mlp_inputs = tf.extract_image_patches(
+    #         mlp_inputs, [1, frame_size_zero, 1, 1], [1, 1, 1, 1],
+    #         [1, 1, 1, 1],
+    #         padding='VALID')
+    #     # reshape into an enormous batch
+    #     mlp_inputs = tf.reshape(mlp_inputs,
+    #                             [-1, mlp_inputs.get_shape()[-1].value])
+    #     print('mlp inputs: {}'.format(mlp_inputs.get_shape()))
+    #     # and run the mlp
+    #     mlp_outputs = autoregressive_mlp(mlp_inputs, shape=mlp_shape)
+    #     # now reshape the outputs to what we want: `[batch, time, ...]`
+    #     print('mlp_outputs: {}'.format(mlp_outputs.get_shape()))
+    #     mlp_outputs = tf.reshape(mlp_outputs,
+    #                              [batch_size,
+    #                               inputs.get_shape()[1].value-frame_size_zero+1,
+    #                               -1])
 
-    return mlp_outputs
+    with tf.variable_scope('output_tier') as scope:
+        #  what appears to be the only feasible solution
+        first_mlp_out = autoregressive_mlp(mlp_inputs[:, :frame_size_zero, :],
+                                           shape=mlp_shape)
+        scope.reuse_variables()
+
+        output_shape = first_mlp_out.get_shape().as_list()
+        data_shape = mlp_inputs.get_shape().as_list()
+        print(output_shape)
+
+        output_ta = tf.TensorArray(tf.float32,
+                                   size=data_shape[1]).write(0, first_mlp_out)
+
+        def apply_mlp(time, outputs, data):
+            input_window = data[:, time:time+frame_size_zero, ...]
+            input_window.set_shape([data_shape[0],
+                                    frame_size_zero,
+                                    data_shape[-1]])
+            mlp_out = autoregressive_mlp(input_window, shape=mlp_shape)
+
+            # mlp_out.set_shape(output_shape)
+
+            output_ta = outputs.write(time, mlp_out)
+
+            return time+1, output_ta, data
+
+        time_steps = inputs.get_shape()[1]
+        time = tf.constant(1, dtype=tf.int32, name='time')
+        _, mlp_outputs, __ = tf.while_loop(
+            cond=lambda time, *_: time < time_steps-frame_size_zero,
+            body=apply_mlp,
+            loop_vars=(time, output_ta, mlp_inputs),
+            swap_memory=True,
+            parallel_iterations=1,)  # TODO: make into param
+            # shape_invariants=([1], output_shape, data_shape))
+
+        output_tensor = mlp_outputs.pack()
+        print(output_tensor.get_shape())
+        output_tensor = tf.reshape(output_tensor,
+                                   [data_shape[0],
+                                    data_shape[1]-frame_size_zero+1,
+                                    output_shape[-1]],
+                                   name='sample-net_output')
+        return output_tensor
 
 
 if __name__ == '__main__':

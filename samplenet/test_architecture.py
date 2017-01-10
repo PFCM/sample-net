@@ -174,3 +174,27 @@ class TestArchitecture(test.TestCase):
         outputs = arch.sample_net_train(inputs)
 
         self.assertEqual(outputs.get_shape().as_list(), [50, 512*8-128+1, 256])
+
+    def test_samplenet_train(self):
+        """make sure we can make a graph and optimise it to match something"""
+        with tf.device('/cpu:0'):
+            inputs = tf.cast(tf.range(2*128*8), tf.uint8)
+            inputs = tf.reshape(inputs, [2, 128*8])
+            outputs = arch.sample_net_train(inputs)
+
+            loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
+                outputs,
+                tf.cast(tf.concat(1, [inputs[:, 128:], inputs[:, 1:]]), tf.int32))
+            loss = tf.reduce_mean(loss)
+            opt = tf.train.AdamOptimizer(0.0001)
+            tstep = opt.minimize(loss)
+
+            with self.test_session(use_gpu=False, force_gpu=False) as sess:
+                sess.run(tf.global_variables_initializer())
+
+                step = 0
+                while step < 100:
+                    batch_loss, _ = sess.run([loss, tstep])
+
+                    print('({}): {}'.format(step, batch_loss))
+                    step += 1
